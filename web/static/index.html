@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>frankenqueue</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header>
+    <h1>frankenqueue</h1>
+    <p class="sub">priority × FIFO/LIFO × delay, durable on local files</p>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>Queues</h2>
+      <form id="create-form" class="row wrap">
+        <input id="q-name" placeholder="name" required />
+        <select id="q-order">
+          <option value="fifo">FIFO</option>
+          <option value="lifo">LIFO</option>
+        </select>
+        <label>visibility ms <input id="q-vis" type="number" value="30000" /></label>
+        <label>max attempts <input id="q-attempts" type="number" value="3" /></label>
+        <label>age boost ms <input id="q-boost" type="number" value="0" /></label>
+        <button type="submit">Create</button>
+      </form>
+      <ul id="queue-list" class="queues"></ul>
+    </section>
+
+    <section id="detail" class="panel" hidden>
+      <h2>Queue <span id="detail-name"></span> <span id="detail-order" class="tag"></span></h2>
+      <div class="grid">
+        <div>
+          <h3>Produce</h3>
+          <form id="enqueue-form" class="stack">
+            <textarea id="m-body" rows="3" placeholder="message body" required></textarea>
+            <div class="row wrap">
+              <label>priority (0-255) <input id="m-priority" type="number" min="0" max="255" value="0" /></label>
+              <label>delay ms <input id="m-delay" type="number" min="0" value="0" /></label>
+              <button type="submit">Enqueue</button>
+              <button type="button" id="burst" class="ghost">Enqueue 10 random</button>
+            </div>
+          </form>
+        </div>
+        <div>
+          <h3>Consume</h3>
+          <div class="row wrap">
+            <label>batch size <input id="c-max" type="number" min="1" value="1" /></label>
+            <label>long poll ms <input id="c-wait" type="number" min="0" value="0" /></label>
+            <button type="button" id="lease-btn">Lease</button>
+            <button type="button" id="auto-btn" class="ghost">Start auto-consumer</button>
+          </div>
+          <ul id="inflight" class="messages"></ul>
+        </div>
+      </div>
+      <h3>Stats</h3>
+      <div id="stats" class="stats"></div>
+      <h3>Dead letters <button type="button" id="replay-all" class="ghost small">Replay all</button></h3>
+      <ul id="dead" class="messages"></ul>
+    </section>
+    <p id="log" class="log"></p>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

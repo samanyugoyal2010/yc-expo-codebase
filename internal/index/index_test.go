@@ -57,11 +57,11 @@ func makeSlot(msgID uint64, state uint8) Slot {
 	}
 }
 
-// ── 1. Entry wire size is 64 bytes ───────────────────────────────────────────
+// ── 1. Entry wire size is 72 bytes ───────────────────────────────────────────
 
 func TestEntrySize(t *testing.T) {
-	if entrySize != 64 {
-		t.Fatalf("entrySize = %d, want 64", entrySize)
+	if entrySize != 72 {
+		t.Fatalf("entrySize = %d, want 72", entrySize)
 	}
 }
 
@@ -243,8 +243,9 @@ func TestSlotRoundTrip(t *testing.T) {
 		Priority:      255,
 		State:         StateDead,
 		Attempts:      0xBEEF,
+		LeaseNonce:    0x0123456789ABCDEF,
 	}
-	var buf [56]byte
+	var buf [64]byte
 	encodeSlot(buf[:], want)
 	got := decodeSlot(buf[:])
 	if got != want {

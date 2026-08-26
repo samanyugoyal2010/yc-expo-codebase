@@ -205,13 +205,13 @@ func TestNackRequeue(t *testing.T) {
 	enq(t, q, "msg", 5, 0)
 	d := lease1(t, q)
 
+	// delayMs = 0 puts the message back on ready immediately.
 	if err := q.Nack(d.Receipt, 0); err != nil {
 		t.Fatalf("Nack: %v", err)
 	}
-
-	// Message should reappear immediately (delayMs = 0 → requeued to delayed wheel with now deadline).
-	// Tick to promote it.
-	q.tick()
+	if q.Stats().Ready != 1 {
+		t.Fatalf("after Nack delayMs=0: ready=%d, want 1", q.Stats().Ready)
+	}
 
 	d2 := lease1(t, q)
 	if string(d2.Payload) != "msg" {
@@ -557,5 +557,254 @@ func TestReplaySelectiveByID(t *testing.T) {
 	dead2, _ := q.DeadLetters(0)
 	if len(dead2) != 1 || dead2[0].ID != id1 {
 		t.Fatalf("after selective replay dead = %+v", dead2)
+	}
+}
+
+func newQWith(t *testing.T, cfg Config) *Queue {
+	t.Helper()
+	if cfg.Name == "" {
+		cfg.Name = "test"
+	}
+	if cfg.VisibilityMs == 0 {
+		cfg.VisibilityMs = 30_000
+	}
+	q, err := openQueue(t.TempDir(), cfg, sharedPages(t))
+	if err != nil {
+		t.Fatalf("openQueue: %v", err)
+	}
+	t.Cleanup(func() { q.Close() })
+	return q
+}
+
+func TestCrashWithoutCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	b, err := OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Create(Config{Name: "jobs", Order: types.FIFO, VisibilityMs: 30_000}); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := b.Get("jobs")
+	enq(t, q, "survive", 5, 0)
+	if err := b.CloseWithoutCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	b2, err := OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b2.Close() })
+	q2, err := b2.Get("jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := lease1(t, q2)
+	if string(d.Payload) != "survive" {
+		t.Fatalf("after crash: got %q", d.Payload)
+	}
+}
+
+func TestDeadLettersSurviveCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	b, err := OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Create(Config{Name: "jobs", Order: types.FIFO, MaxAttempts: 1, VisibilityMs: 30_000}); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := b.Get("jobs")
+	enq(t, q, "poison", 5, 0)
+	d := lease1(t, q)
+	if err := q.Nack(d.Receipt, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CloseWithoutCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	b2, err := OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b2.Close() })
+	q2, _ := b2.Get("jobs")
+	dead, _ := q2.DeadLetters(0)
+	if len(dead) != 1 || string(dead[0].Payload) != "poison" {
+		t.Fatalf("dead after restart = %+v", dead)
+	}
+}
+
+func TestConcurrentLeaseExclusive(t *testing.T) {
+	q := newQ(t, types.FIFO, 0)
+	enq(t, q, "only", 5, 0)
+
+	got := make(chan Delivery, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ds, err := q.Lease(1, 0)
+			if err != nil {
+				t.Errorf("Lease: %v", err)
+				return
+			}
+			if len(ds) == 1 {
+				got <- ds[0]
+			}
+		}()
+	}
+	wg.Wait()
+	close(got)
+	n := 0
+	for range got {
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("concurrent Lease delivered %d copies, want 1", n)
+	}
+}
+
+func TestAgeBoostReordersHeap(t *testing.T) {
+	q := newQWith(t, Config{Order: types.FIFO, AgeBoostMs: 100, VisibilityMs: 30_000})
+	base := time.Unix(1_700_000_000, 0)
+	q.nowFn = func() time.Time { return base }
+	enq(t, q, "old-low", 1, 0)
+
+	q.nowFn = func() time.Time { return base.Add(500 * time.Millisecond) }
+	enq(t, q, "new-high", 5, 0)
+	q.tick()
+
+	d := lease1(t, q)
+	if string(d.Payload) != "old-low" {
+		t.Fatalf("age boost order: got %q, want old-low (prio 1 + 5 boost > 5)", d.Payload)
+	}
+}
+
+func TestMaxDepthConcurrent(t *testing.T) {
+	q := newQWith(t, Config{Order: types.FIFO, MaxDepth: 10, VisibilityMs: 30_000})
+	const goroutines = 20
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok, failed := 0, 0
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := q.Enqueue(EnqueueRequest{Payload: []byte(fmt.Sprintf("m%d", i))})
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				ok++
+			} else if errors.Is(err, ErrFull) {
+				failed++
+			} else {
+				t.Errorf("unexpected: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if ok != 10 || failed != 10 {
+		t.Fatalf("ok=%d failed=%d, want 10/10", ok, failed)
+	}
+	if q.Stats().Ready != 10 {
+		t.Fatalf("ready=%d, want 10", q.Stats().Ready)
+	}
+}
+
+func TestDurableLeaseSurvivesCrash(t *testing.T) {
+	dir := t.TempDir()
+	b, err := OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Create(Config{Name: "jobs", Order: types.FIFO, DurableLeases: true, VisibilityMs: 60_000}); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := b.Get("jobs")
+	enq(t, q, "leased", 5, 0)
+	d := lease1(t, q)
+	if err := b.CloseWithoutCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	b2, err := OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b2.Close() })
+	q2, _ := b2.Get("jobs")
+	st := q2.Stats()
+	if st.Inflight != 1 || st.Ready != 0 {
+		t.Fatalf("durable lease after crash: %+v", st)
+	}
+	ds, _ := q2.Lease(1, 0)
+	if len(ds) != 0 {
+		t.Fatalf("leased again: %v", bodies(ds))
+	}
+	if err := q2.Ack(d.Receipt); err != nil {
+		t.Fatalf("ack recovered lease: %v", err)
+	}
+}
+
+func TestApplyCursorDoesNotAdvancePastHole(t *testing.T) {
+	var c applyCursor
+	c.reset(9)
+	c.begin(10, 10)
+	c.begin(11, 12)
+	c.finish(11, 12)
+	if got := c.applied(); got != 9 {
+		t.Fatalf("applied=%d, want 9 while LSN 10 is unapplied", got)
+	}
+	c.finish(10, 10)
+	if got := c.applied(); got != 12 {
+		t.Fatalf("applied=%d, want 12 after hole filled", got)
+	}
+}
+
+func TestExpireDeadSurvivesUncleanClose(t *testing.T) {
+	dir := t.TempDir()
+	b, err := OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Create(Config{Name: "jobs", Order: types.FIFO, MaxAttempts: 1, VisibilityMs: 50}); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := b.Get("jobs")
+	base := time.Unix(1_700_000_000, 0)
+	q.nowFn = func() time.Time { return base }
+	enq(t, q, "poison", 5, 0)
+	_ = lease1(t, q)
+
+	q.nowFn = func() time.Time { return base.Add(time.Second) }
+	q.tick()
+	dead, _ := q.DeadLetters(0)
+	if len(dead) != 1 {
+		t.Fatalf("dead after expire = %d, want 1", len(dead))
+	}
+	if err := b.CloseWithoutCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	b2, err := OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b2.Close() })
+	q2, _ := b2.Get("jobs")
+	dead, _ = q2.DeadLetters(0)
+	if len(dead) != 1 || string(dead[0].Payload) != "poison" {
+		t.Fatalf("dead after crash = %+v", dead)
+	}
+	ds, _ := q2.Lease(1, 0)
+	if len(ds) != 0 {
+		t.Fatalf("dead letter became ready: %v", bodies(ds))
 	}
 }

@@ -57,6 +57,10 @@ type Queue struct {
 
 	nextMsgID atomic.Uint64
 
+	// reserved counts in-flight Enqueue calls that have passed MaxDepth
+	// but are not yet on ready/delayed. Prevents a check-then-act overflow.
+	reserved int
+
 	// Atomic lifetime counters (read without lock for Stats).
 	statEnqueued  atomic.Uint64
 	statDelivered atomic.Uint64
@@ -79,6 +83,9 @@ type Queue struct {
 	// Batch commit: producers submit here, committer flushes as a group.
 	commitCh chan commitRequest
 
+	apply        applyCursor
+	checkpointMu sync.Mutex
+
 	// Overridable clock for deterministic tests.
 	nowFn func() time.Time
 }
@@ -97,7 +104,77 @@ const (
 type commitRequest struct {
 	payloadRefs []pagestore.SlotRef
 	walRecs     []walPkg.Record
-	done        chan<- error
+	done        chan<- commitResult
+}
+
+type commitResult struct {
+	firstLSN uint64
+	lastLSN  uint64
+	err      error
+}
+
+// applyCursor is a contiguous apply watermark. Checkpoint may only truncate
+// through applied(), which does not advance past a durable LSN whose index
+// mutation is still in flight. begin() runs in the committer before producers
+// are woken; finish() runs after the matching index apply.
+type applyCursor struct {
+	mu      sync.Mutex
+	pending map[uint64]struct{} // first LSN of each unapplied durable request
+	high    uint64              // max last LSN begun
+	contig  uint64              // max L such that every begun LSN ≤ L is applied
+}
+
+func (c *applyCursor) reset(lsn uint64) {
+	c.mu.Lock()
+	c.pending = make(map[uint64]struct{})
+	c.high = lsn
+	c.contig = lsn
+	c.mu.Unlock()
+}
+
+func (c *applyCursor) begin(first, last uint64) {
+	if last == 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[uint64]struct{})
+	}
+	c.pending[first] = struct{}{}
+	if last > c.high {
+		c.high = last
+	}
+	c.recompute()
+	c.mu.Unlock()
+}
+
+func (c *applyCursor) finish(first, last uint64) {
+	if last == 0 {
+		return
+	}
+	c.mu.Lock()
+	delete(c.pending, first)
+	c.recompute()
+	c.mu.Unlock()
+}
+
+func (c *applyCursor) recompute() {
+	contig := c.high
+	for first := range c.pending {
+		if first == 0 {
+			continue
+		}
+		if first-1 < contig {
+			contig = first - 1
+		}
+	}
+	c.contig = contig
+}
+
+func (c *applyCursor) applied() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.contig
 }
 
 // openQueue opens or creates a queue from its directory.  pages is shared with
@@ -130,7 +207,7 @@ func openQueue(dir string, cfg Config, pages *pagestore.Store) (*Queue, error) {
 		stopCh:           make(chan struct{}),
 		nowFn:            time.Now,
 		lastCheckpointMs: time.Now().UnixMilli(),
-		commitCh:         make(chan commitRequest, commitBatchSize*4),
+		commitCh:         make(chan commitRequest), // unbuffered: send fails closed after committer exits
 	}
 	q.ready = newReadyHeap(cfg.Order, cfg.AgeBoostMs, q.nowMs)
 
@@ -188,22 +265,34 @@ func (q *Queue) nowMs() int64 { return q.nowFn().UnixMilli() }
 
 // Enqueue adds one or more messages atomically.  Payload pages are fsynced
 // before the WAL record so the invariant (WAL record → payload durable) holds.
-func (q *Queue) Enqueue(reqs ...EnqueueRequest) ([]uint64, error) {
+func (q *Queue) Enqueue(reqs ...EnqueueRequest) (ids []uint64, err error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
 	now := q.nowMs()
 	maxDel := q.cfg.maxDelayMs()
 	for _, r := range reqs {
 		if r.DelayMs > maxDel {
 			return nil, fmt.Errorf("%w: requested %d ms, max %d ms", ErrDelayTooLong, r.DelayMs, maxDel)
 		}
-		if q.cfg.MaxDepth > 0 {
-			q.mu.Lock()
-			depth := q.ready.Len() + q.delayed.Len()
-			q.mu.Unlock()
-			if depth >= q.cfg.MaxDepth {
-				return nil, ErrFull
-			}
-		}
 	}
+
+	n := len(reqs)
+	q.mu.Lock()
+	if q.cfg.MaxDepth > 0 && q.ready.Len()+q.delayed.Len()+q.reserved+n > q.cfg.MaxDepth {
+		q.mu.Unlock()
+		return nil, ErrFull
+	}
+	q.reserved += n
+	q.mu.Unlock()
+	unreserve := true
+	defer func() {
+		if unreserve {
+			q.mu.Lock()
+			q.reserved -= n
+			q.mu.Unlock()
+		}
+	}()
 
 	type item struct {
 		ref      pagestore.SlotRef
@@ -214,6 +303,19 @@ func (q *Queue) Enqueue(reqs ...EnqueueRequest) ([]uint64, error) {
 	}
 	items := make([]item, len(reqs))
 	refs := make([]pagestore.SlotRef, 0, len(reqs))
+	indexRefs := make([]uint64, 0, len(reqs))
+
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, ref := range refs {
+			_ = q.pages.Release(ref)
+		}
+		for _, ir := range indexRefs {
+			q.idx.FreeSlot(ir)
+		}
+	}()
 
 	// Phase 1: allocate payload slots and write payload bytes.
 	for i, req := range reqs {
@@ -221,9 +323,9 @@ func (q *Queue) Enqueue(reqs ...EnqueueRequest) ([]uint64, error) {
 		if sz == 0 {
 			sz = 1
 		}
-		ref, buf, err := q.pages.Alloc(sz)
-		if err != nil {
-			return nil, err
+		ref, buf, allocErr := q.pages.Alloc(sz)
+		if allocErr != nil {
+			return nil, allocErr
 		}
 		if len(req.Payload) > 0 {
 			copy(buf, req.Payload)
@@ -237,14 +339,14 @@ func (q *Queue) Enqueue(reqs ...EnqueueRequest) ([]uint64, error) {
 	}
 
 	// Phase 2: assign IDs + allocate index slots + build WAL records.
-	// All atomics — no queue lock needed here.
 	walRecs := make([]walPkg.Record, len(reqs))
 	for i, req := range reqs {
 		msgID := q.nextMsgID.Add(1)
-		indexRef, err := q.idx.AllocSlot()
-		if err != nil {
-			return nil, err
+		indexRef, allocErr := q.idx.AllocSlot()
+		if allocErr != nil {
+			return nil, allocErr
 		}
+		indexRefs = append(indexRefs, indexRef)
 		items[i].msgID = msgID
 		items[i].indexRef = indexRef
 		walRecs[i] = walPkg.Record{
@@ -261,17 +363,13 @@ func (q *Queue) Enqueue(reqs ...EnqueueRequest) ([]uint64, error) {
 		}
 	}
 
-	// Phase 3: submit to committer.
-	// The committer accumulates requests until commitBatchSize is reached OR
-	// commitLagDuration elapses, then does ONE payload fsync + ONE WAL fsync
-	// for the whole batch (§6.1 invariant: payload durable before WAL record).
-	if err := q.submitCommit(refs, walRecs); err != nil {
-		return nil, err
+	lsnFirst, lsnLast, commitErr := q.submitCommit(refs, walRecs)
+	if commitErr != nil {
+		return nil, commitErr
 	}
 
-	// Phase 5: update index + volatile heaps (under lock).
 	q.mu.Lock()
-	ids := make([]uint64, len(reqs))
+	ids = make([]uint64, len(reqs))
 	for i, it := range items {
 		ids[i] = it.msgID
 		st := index.StateReady
@@ -295,9 +393,14 @@ func (q *Queue) Enqueue(reqs ...EnqueueRequest) ([]uint64, error) {
 			q.delayed.add(wheelEntry{deadline: it.availMs, msgID: it.msgID, indexRef: it.indexRef})
 		}
 	}
+	q.reserved -= n
+	unreserve = false
+	q.apply.finish(lsnFirst, lsnLast)
 	q.statEnqueued.Add(uint64(len(reqs)))
 	q.mu.Unlock()
 
+	refs = nil
+	indexRefs = nil
 	q.notify()
 	return ids, nil
 }
@@ -318,10 +421,15 @@ func (q *Queue) Lease(max int, visibilityMs int64) ([]Delivery, error) {
 	until := now + visDur
 
 	q.mu.Lock()
-	// Promote due delayed messages.
 	q.promoteLocked(now)
 
+	type payloadRef struct {
+		ref pagestore.SlotRef
+		len uint32
+	}
 	var ds []Delivery
+	payloads := make([]payloadRef, 0, max)
+	leaseRecs := make([]walPkg.Record, 0, max)
 	for len(ds) < max && q.ready.Len() > 0 {
 		e := q.ready.pop()
 		slot, ok := q.idx.GetByRef(e.indexRef)
@@ -332,6 +440,7 @@ func (q *Queue) Lease(max int, visibilityMs int64) ([]Delivery, error) {
 		slot.Attempts++
 		slot.State = index.StateInflight
 		slot.LeaseUntilMs = until
+		slot.LeaseNonce = nonce
 		q.idx.Put(e.indexRef, slot)
 
 		receipt := encodeReceipt(slot.MsgID, slot.Attempts, nonce)
@@ -345,26 +454,70 @@ func (q *Queue) Lease(max int, visibilityMs int64) ([]Delivery, error) {
 			Receipt:      receipt,
 			LeaseUntilMs: until,
 		})
+		payloads = append(payloads, payloadRef{ref: pagestore.SlotRef(slot.PayloadRef), len: slot.PayloadLen})
+		if q.cfg.DurableLeases {
+			leaseRecs = append(leaseRecs, walPkg.Record{
+				Op: walPkg.OpLease,
+				Body: walPkg.Lease{
+					MsgID:        slot.MsgID,
+					Nonce:        nonce,
+					Attempt:      slot.Attempts,
+					LeaseUntilMs: until,
+				},
+			})
+		}
 	}
 	q.mu.Unlock()
 
-	// Read payloads (outside lock — zero-copy mmap slice, trimmed to PayloadLen).
-	for i := range ds {
-		info := q.receipts[ds[i].ID]
-		slot, ok := q.idx.GetByRef(info.indexRef)
-		if !ok {
-			continue
+	if len(leaseRecs) > 0 {
+		first, last, err := q.submitCommit(nil, leaseRecs)
+		if err != nil {
+			q.rollbackLeases(ds)
+			return nil, err
 		}
-		data, err := q.pages.Read(pagestore.SlotRef(slot.PayloadRef))
-		if err == nil {
-			cp := make([]byte, slot.PayloadLen)
-			copy(cp, data[:slot.PayloadLen])
+		q.apply.finish(first, last)
+	}
+
+	for i := range ds {
+		data, err := q.pages.Read(payloads[i].ref)
+		if err == nil && int(payloads[i].len) <= len(data) {
+			cp := make([]byte, payloads[i].len)
+			copy(cp, data[:payloads[i].len])
 			ds[i].Payload = cp
 		}
 	}
 
 	q.statDelivered.Add(uint64(len(ds)))
 	return ds, nil
+}
+
+func (q *Queue) rollbackLeases(ds []Delivery) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, d := range ds {
+		_, attempt, nonce, err := decodeReceipt(d.Receipt)
+		if err != nil {
+			continue
+		}
+		info, ok := q.receipts[d.ID]
+		if !ok || info.nonce != nonce || info.attempt != attempt {
+			continue // a newer lease owns this message
+		}
+		delete(q.receipts, d.ID)
+		q.inflight.remove(d.ID)
+		slot, ok := q.idx.GetByRef(info.indexRef)
+		if !ok {
+			continue
+		}
+		slot.State = index.StateReady
+		slot.LeaseUntilMs = 0
+		slot.LeaseNonce = 0
+		if slot.Attempts > 0 {
+			slot.Attempts--
+		}
+		q.idx.Put(info.indexRef, slot)
+		q.ready.push(heapEntry{msgID: slot.MsgID, priority: slot.Priority, indexRef: info.indexRef, enqueuedAtMs: slot.EnqueuedAtMs})
+	}
 }
 
 // LeaseWait is like Lease but blocks up to wait for a message to become ready.
@@ -405,22 +558,44 @@ func (q *Queue) Ack(receipt string) error {
 	slot, _ := q.idx.GetByRef(indexRef)
 	q.mu.Unlock()
 
-	// WAL ACK is fsynced (durable: this removes the message from future delivery).
-	if _, err := q.wal.Append(walPkg.Record{
+	first, last, err := q.submitCommit(nil, []walPkg.Record{{
 		Op:   walPkg.OpAck,
 		Body: walPkg.Ack{MsgID: msgID, Nonce: nonce},
-	}); err != nil {
+	}})
+	if err != nil {
+		q.restoreLease(info, slot)
 		return err
 	}
 
-	// Release index and payload slots now that WAL ACK is durable.
 	if slot.MsgID != 0 {
 		q.pages.Release(pagestore.SlotRef(slot.PayloadRef))
 	}
 	q.idx.FreeSlot(indexRef)
+	q.apply.finish(first, last)
 
 	q.statAcked.Add(1)
 	return nil
+}
+
+func (q *Queue) restoreLease(info leaseInfo, slot index.Slot) {
+	q.mu.Lock()
+	q.restoreLeaseLocked(info, slot)
+	q.mu.Unlock()
+}
+
+func (q *Queue) restoreLeaseLocked(info leaseInfo, slot index.Slot) {
+	if slot.MsgID == 0 {
+		return
+	}
+	if _, taken := q.receipts[slot.MsgID]; taken {
+		return
+	}
+	slot.State = index.StateInflight
+	slot.LeaseUntilMs = info.until
+	slot.LeaseNonce = info.nonce
+	q.idx.Put(info.indexRef, slot)
+	q.receipts[slot.MsgID] = info
+	q.inflight.add(wheelEntry{deadline: info.until, msgID: slot.MsgID, indexRef: info.indexRef, nonce: info.nonce})
 }
 
 // Nack returns the message for redelivery after delayMs.
@@ -441,33 +616,52 @@ func (q *Queue) Nack(receipt string, delayMs int64) error {
 	q.inflight.remove(msgID)
 	indexRef := info.indexRef
 	slot, _ := q.idx.GetByRef(indexRef)
-
 	now := q.nowMs()
 	requeueAt := now
 	if delayMs > 0 {
 		requeueAt = now + delayMs
 	}
-
-	if q.cfg.MaxAttempts > 0 && slot.Attempts >= q.cfg.MaxAttempts {
-		payload := q.readPayloadLocked(slot)
-		q.deadLetterLocked(slot, indexRef, payload)
-		q.mu.Unlock()
-		q.wal.Append(walPkg.Record{Op: walPkg.OpDead, Body: walPkg.Dead{MsgID: msgID, Reason: 1}})
-		q.statNacked.Add(1)
-		return nil
-	}
-
-	slot.State = index.StateDelayed
-	slot.LeaseUntilMs = 0
-	q.idx.Put(indexRef, slot)
-	q.delayed.add(wheelEntry{deadline: requeueAt, msgID: slot.MsgID, indexRef: indexRef})
+	toDead := q.cfg.MaxAttempts > 0 && slot.Attempts >= q.cfg.MaxAttempts
 	q.mu.Unlock()
 
-	// NACK is volatile (no fsync).
-	q.wal.Append(walPkg.Record{
-		Op:   walPkg.OpNack,
-		Body: walPkg.Nack{MsgID: msgID, Nonce: nonce, RequeueAtMs: requeueAt},
-	})
+	var rec walPkg.Record
+	if toDead {
+		rec = walPkg.Record{Op: walPkg.OpDead, Body: walPkg.Dead{MsgID: msgID, Reason: 1}}
+	} else {
+		rec = walPkg.Record{Op: walPkg.OpNack, Body: walPkg.Nack{MsgID: msgID, Nonce: nonce, RequeueAtMs: requeueAt}}
+	}
+	first, last, err := q.submitCommit(nil, []walPkg.Record{rec})
+	if err != nil {
+		q.restoreLease(info, slot)
+		return err
+	}
+
+	q.mu.Lock()
+	promoted := false
+	if toDead {
+		payload := q.readPayloadLocked(slot)
+		q.deadLetterLocked(slot, indexRef, payload)
+	} else if requeueAt <= q.nowMs() {
+		slot.State = index.StateReady
+		slot.LeaseUntilMs = 0
+		slot.LeaseNonce = 0
+		slot.AvailableAtMs = requeueAt
+		q.idx.Put(indexRef, slot)
+		q.ready.push(heapEntry{msgID: slot.MsgID, priority: slot.Priority, indexRef: indexRef, enqueuedAtMs: slot.EnqueuedAtMs})
+		promoted = true
+	} else {
+		slot.State = index.StateDelayed
+		slot.LeaseUntilMs = 0
+		slot.LeaseNonce = 0
+		slot.AvailableAtMs = requeueAt
+		q.idx.Put(indexRef, slot)
+		q.delayed.add(wheelEntry{deadline: requeueAt, msgID: slot.MsgID, indexRef: indexRef})
+	}
+	q.apply.finish(first, last)
+	q.mu.Unlock()
+	if promoted {
+		q.notify()
+	}
 	q.statNacked.Add(1)
 	return nil
 }
@@ -522,19 +716,34 @@ func (q *Queue) Replay(ids []uint64, delayMs int64) ([]uint64, error) {
 	}
 	newIDs, err := q.Enqueue(reqs...)
 	if err != nil {
-		// Put them back.
 		q.mu.Lock()
 		q.dead = append(q.dead, toReplay...)
 		q.mu.Unlock()
 		return nil, err
 	}
+	for _, dm := range toReplay {
+		if dm.payloadRef != 0 {
+			_ = q.pages.Release(pagestore.SlotRef(dm.payloadRef))
+		}
+		if dm.indexRef != 0 {
+			q.idx.FreeSlot(dm.indexRef)
+		}
+	}
 	q.statReplayed.Add(uint64(len(newIDs)))
 	return newIDs, nil
 }
 
-// Checkpoint writes the current index to disk and truncates the WAL.
+// Checkpoint writes the current index to disk and truncates the WAL up to
+// the highest LSN that is both durable and applied to the index. Using
+// DurableLSN alone can drop records the snapshot does not yet contain.
 func (q *Queue) Checkpoint() error {
+	q.checkpointMu.Lock()
+	defer q.checkpointMu.Unlock()
+
 	lsn := q.wal.DurableLSN()
+	if applied := q.apply.applied(); applied < lsn {
+		lsn = applied
+	}
 	if err := q.idx.Checkpoint(lsn); err != nil {
 		return err
 	}
@@ -560,7 +769,7 @@ func (q *Queue) Stats() Stats {
 	}
 }
 
-// Close stops the ticker and flushes state.
+// Close stops the ticker, checkpoints, and flushes the WAL.
 func (q *Queue) Close() error {
 	close(q.stopCh)
 	q.wg.Wait()
@@ -568,13 +777,23 @@ func (q *Queue) Close() error {
 	return q.wal.Close()
 }
 
+// closeWithoutCheckpoint stops background work and closes the WAL without
+// writing index.dat. Tests use this to simulate a crash after durable ops.
+func (q *Queue) closeWithoutCheckpoint() error {
+	close(q.stopCh)
+	q.wg.Wait()
+	return q.wal.Close()
+}
+
 // --- Internal helpers --------------------------------------------------------
 
 func (q *Queue) recover() error {
 	from := q.idx.CheckpointLSN()
+	if from > 0 {
+		from++ // records up to checkpointLSN are already in the index
+	}
 	now := q.nowMs()
 
-	// Step 1: Replay WAL — only mutate the index, never the heaps.
 	if err := q.wal.Replay(from, func(_ uint64, rec walPkg.Record) error {
 		switch rec.Op {
 		case walPkg.OpEnqueue:
@@ -594,6 +813,16 @@ func (q *Queue) recover() error {
 				State:         st,
 			})
 
+		case walPkg.OpLease:
+			l := rec.Body.(walPkg.Lease)
+			if ref, slot, ok := q.findSlot(l.MsgID); ok {
+				slot.State = index.StateInflight
+				slot.Attempts = l.Attempt
+				slot.LeaseUntilMs = l.LeaseUntilMs
+				slot.LeaseNonce = l.Nonce
+				q.idx.Put(ref, slot)
+			}
+
 		case walPkg.OpAck:
 			a := rec.Body.(walPkg.Ack)
 			if ref, slot, ok := q.findSlot(a.MsgID); ok {
@@ -607,6 +836,17 @@ func (q *Queue) recover() error {
 			if ref, slot, ok := q.findSlot(n.MsgID); ok {
 				slot.State = index.StateDelayed
 				slot.LeaseUntilMs = 0
+				slot.LeaseNonce = 0
+				slot.AvailableAtMs = n.RequeueAtMs
+				q.idx.Put(ref, slot)
+			}
+
+		case walPkg.OpExpire:
+			e := rec.Body.(walPkg.Expire)
+			if ref, slot, ok := q.findSlot(e.MsgID); ok && slot.State == index.StateInflight {
+				slot.State = index.StateReady
+				slot.LeaseUntilMs = 0
+				slot.LeaseNonce = 0
 				q.idx.Put(ref, slot)
 			}
 
@@ -622,25 +862,56 @@ func (q *Queue) recover() error {
 		return err
 	}
 
-	// Step 2: All INFLIGHT → READY (leases are volatile; §6.3).
-	q.idx.Scan(func(ref uint64, s index.Slot) {
-		if s.State == index.StateInflight {
-			s.State = index.StateReady
-			s.LeaseUntilMs = 0
-			q.idx.Put(ref, s)
-		}
-	})
+	type live struct {
+		ref uint64
+		s   index.Slot
+	}
+	snapshot := func() []live {
+		var slots []live
+		q.idx.Scan(func(ref uint64, s index.Slot) {
+			slots = append(slots, live{ref: ref, s: s})
+		})
+		return slots
+	}
 
-	// Step 3: Rebuild heaps and wheels from the final index state.
-	q.idx.Scan(func(ref uint64, s index.Slot) {
+	// Demote inflight slots that should not survive restart. Must not Put
+	// inside Scan: Scan holds RLock and Put needs Lock (deadlock).
+	for _, e := range snapshot() {
+		s := e.s
+		if s.State != index.StateInflight {
+			continue
+		}
+		keep := q.cfg.DurableLeases && s.LeaseUntilMs > now && s.LeaseNonce != 0
+		if keep {
+			continue
+		}
+		s.State = index.StateReady
+		s.LeaseUntilMs = 0
+		s.LeaseNonce = 0
+		q.idx.Put(e.ref, s)
+	}
+
+	for _, e := range snapshot() {
+		s := e.s
 		bumpMsgID(&q.nextMsgID, s.MsgID)
 		switch s.State {
 		case index.StateReady:
-			q.ready.push(heapEntry{msgID: s.MsgID, priority: s.Priority, indexRef: ref, enqueuedAtMs: s.EnqueuedAtMs})
+			q.ready.push(heapEntry{msgID: s.MsgID, priority: s.Priority, indexRef: e.ref, enqueuedAtMs: s.EnqueuedAtMs})
 		case index.StateDelayed:
-			q.delayed.add(wheelEntry{deadline: s.AvailableAtMs, msgID: s.MsgID, indexRef: ref})
+			q.delayed.add(wheelEntry{deadline: s.AvailableAtMs, msgID: s.MsgID, indexRef: e.ref})
+		case index.StateInflight:
+			q.receipts[s.MsgID] = leaseInfo{nonce: s.LeaseNonce, attempt: s.Attempts, until: s.LeaseUntilMs, indexRef: e.ref}
+			q.inflight.add(wheelEntry{deadline: s.LeaseUntilMs, msgID: s.MsgID, indexRef: e.ref, nonce: s.LeaseNonce})
+		case index.StateDead:
+			payload := q.readPayloadLocked(s)
+			q.deadLetterLocked(s, e.ref, payload)
 		}
-	})
+	}
+	applied := q.wal.DurableLSN()
+	if cp := q.idx.CheckpointLSN(); cp > applied {
+		applied = cp
+	}
+	q.apply.reset(applied)
 	return nil
 }
 
@@ -670,14 +941,28 @@ func (q *Queue) promoteLocked(now int64) {
 }
 
 func (q *Queue) deadLetterLocked(slot index.Slot, indexRef uint64, payload []byte) {
+	for _, d := range q.dead {
+		if d.ID == slot.MsgID {
+			slot.State = index.StateDead
+			slot.LeaseUntilMs = 0
+			slot.LeaseNonce = 0
+			q.idx.Put(indexRef, slot)
+			return
+		}
+	}
 	q.dead = append(q.dead, DeadMessage{
 		ID:           slot.MsgID,
 		Payload:      payload,
 		Priority:     slot.Priority,
 		Attempts:     slot.Attempts,
 		EnqueuedAtMs: slot.EnqueuedAtMs,
+		indexRef:     indexRef,
+		payloadRef:   slot.PayloadRef,
 	})
-	q.idx.FreeSlot(indexRef)
+	slot.State = index.StateDead
+	slot.LeaseUntilMs = 0
+	slot.LeaseNonce = 0
+	q.idx.Put(indexRef, slot)
 }
 
 func (q *Queue) readPayloadLocked(slot index.Slot) []byte {
@@ -709,10 +994,15 @@ func (q *Queue) findSlot(msgID uint64) (uint64, index.Slot, bool) {
 
 // submitCommit enqueues a commit request and blocks until the committer goroutine
 // has fsynced both the payload pages and the WAL record as part of a batch.
-func (q *Queue) submitCommit(refs []pagestore.SlotRef, walRecs []walPkg.Record) error {
-	done := make(chan error, 1)
-	q.commitCh <- commitRequest{payloadRefs: refs, walRecs: walRecs, done: done}
-	return <-done
+func (q *Queue) submitCommit(refs []pagestore.SlotRef, walRecs []walPkg.Record) (uint64, uint64, error) {
+	done := make(chan commitResult, 1)
+	select {
+	case q.commitCh <- commitRequest{payloadRefs: refs, walRecs: walRecs, done: done}:
+	case <-q.stopCh:
+		return 0, 0, walPkg.ErrClosed
+	}
+	res := <-done
+	return res.firstLSN, res.lastLSN, res.err
 }
 
 // runCommitter is the batch-commit goroutine.  It drains commitCh and flushes
@@ -761,13 +1051,26 @@ func (q *Queue) runCommitter() {
 		err := q.pages.Sync(syncRefs)
 
 		// Step 2: WAL AppendBatch — group commits its own fsync internally.
+		var lsn uint64
 		if err == nil {
-			_, err = q.wal.AppendBatch(allWalRecs)
+			lsn, err = q.wal.AppendBatch(allWalRecs)
 		}
 
-		// Step 3: wake every waiting producer.
+		// Step 3: register each request as unapplied BEFORE waking producers,
+		// so Checkpoint cannot jump past a hole.
+		assigned := lsn
+		if err == nil && len(allWalRecs) > 0 {
+			assigned = lsn - uint64(len(allWalRecs))
+		}
 		for _, r := range batch {
-			r.done <- err
+			first, last := uint64(0), uint64(0)
+			if err == nil && len(r.walRecs) > 0 {
+				first = assigned + 1
+				last = assigned + uint64(len(r.walRecs))
+				assigned = last
+				q.apply.begin(first, last)
+			}
+			r.done <- commitResult{firstLSN: first, lastLSN: last, err: err}
 		}
 		batch = batch[:0]
 	}
@@ -823,6 +1126,10 @@ func (q *Queue) tick() {
 	now := q.nowMs()
 	q.mu.Lock()
 
+	if q.cfg.AgeBoostMs > 0 {
+		q.ready.refresh()
+	}
+
 	// Promote delayed → ready.
 	before := q.ready.Len()
 	q.promoteLocked(now)
@@ -830,9 +1137,12 @@ func (q *Queue) tick() {
 
 	// Expire overdue inflight leases.
 	type expiredEntry struct {
-		msgID  uint64
-		nonce  uint64
-		toDead bool
+		msgID    uint64
+		nonce    uint64
+		toDead   bool
+		indexRef uint64
+		slot     index.Slot
+		info     leaseInfo
 	}
 	expiredLeases := q.inflight.popExpired(now)
 	var toExpire []expiredEntry
@@ -851,27 +1161,42 @@ func (q *Queue) tick() {
 		q.statExpired.Add(1)
 
 		if q.cfg.MaxAttempts > 0 && slot.Attempts >= q.cfg.MaxAttempts {
-			payload := q.readPayloadLocked(slot)
-			q.deadLetterLocked(slot, e.indexRef, payload)
-			toExpire = append(toExpire, expiredEntry{msgID: e.msgID, nonce: e.nonce, toDead: true})
+			toExpire = append(toExpire, expiredEntry{msgID: e.msgID, nonce: e.nonce, toDead: true, indexRef: e.indexRef, slot: slot, info: info})
 		} else {
 			slot.State = index.StateReady
 			slot.LeaseUntilMs = 0
+			slot.LeaseNonce = 0
 			q.idx.Put(e.indexRef, slot)
 			q.ready.push(heapEntry{msgID: slot.MsgID, priority: slot.Priority, indexRef: e.indexRef, enqueuedAtMs: slot.EnqueuedAtMs})
 			toExpire = append(toExpire, expiredEntry{msgID: e.msgID, nonce: e.nonce})
 			promoted = true
 		}
-	
 	}
 	q.mu.Unlock()
 
-	// Async WAL writes (volatile — no fsync needed).
 	for _, e := range toExpire {
 		if e.toDead {
-			q.wal.Append(walPkg.Record{Op: walPkg.OpDead, Body: walPkg.Dead{MsgID: e.msgID, Reason: 2}})
+			first, last, err := q.submitCommit(nil, []walPkg.Record{{
+				Op:   walPkg.OpDead,
+				Body: walPkg.Dead{MsgID: e.msgID, Reason: 2},
+			}})
+			if err != nil {
+				q.restoreLease(e.info, e.slot)
+				continue
+			}
+			q.mu.Lock()
+			payload := q.readPayloadLocked(e.slot)
+			q.deadLetterLocked(e.slot, e.indexRef, payload)
+			q.apply.finish(first, last)
+			q.mu.Unlock()
 		} else {
-			q.wal.Append(walPkg.Record{Op: walPkg.OpExpire, Body: walPkg.Expire{MsgID: e.msgID, Nonce: e.nonce}})
+			first, last, err := q.submitCommit(nil, []walPkg.Record{{
+				Op:   walPkg.OpExpire,
+				Body: walPkg.Expire{MsgID: e.msgID, Nonce: e.nonce},
+			}})
+			if err == nil {
+				q.apply.finish(first, last)
+			}
 		}
 	}
 

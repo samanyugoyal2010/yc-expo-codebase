@@ -15,6 +15,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -69,7 +70,10 @@ type WAL struct {
 	pendingCh chan pendingWrite
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
+	closed    atomic.Bool
 }
+
+var ErrClosed = errors.New("wal: closed")
 
 type pendingWrite struct {
 	data []byte
@@ -167,9 +171,16 @@ func (w *WAL) openNewSegment(first uint64) error {
 	return nil
 }
 
-// Close stops the committer goroutine and closes the active segment.
+// Close drains in-flight appends, fsyncs them, then closes the active segment.
 func (w *WAL) Close() error {
+	if w.closed.Swap(true) {
+		return nil
+	}
+	// Hold appendMu so no AppendBatch can send on pendingCh after the
+	// committer leaves its receive loop.
+	w.appendMu.Lock()
 	close(w.stopCh)
+	w.appendMu.Unlock()
 	w.wg.Wait()
 	w.segMu.Lock()
 	defer w.segMu.Unlock()
@@ -193,9 +204,17 @@ func (w *WAL) AppendBatch(recs []Record) (uint64, error) {
 		return w.DurableLSN(), nil
 	}
 
+	if w.closed.Load() {
+		return 0, ErrClosed
+	}
+
 	done := make(chan error, 1)
 
 	w.appendMu.Lock()
+	if w.closed.Load() {
+		w.appendMu.Unlock()
+		return 0, ErrClosed
+	}
 	var buf []byte
 	var lastLSN uint64
 	for _, rec := range recs {
@@ -284,6 +303,9 @@ func (w *WAL) Replay(from uint64, fn func(lsn uint64, rec Record) error) error {
 // by the checkpoint at upTo (i.e. all records have LSN <= upTo).
 // Only closed segments are removed; the active segment is never deleted.
 func (w *WAL) TruncatePrefix(upTo uint64) error {
+	// Lock order matches maybeRotate: segMu then segsMu.
+	w.segMu.Lock()
+	defer w.segMu.Unlock()
 	w.segsMu.Lock()
 	defer w.segsMu.Unlock()
 
@@ -295,13 +317,10 @@ func (w *WAL) TruncatePrefix(upTo uint64) error {
 		if i+1 < len(w.segs) {
 			nextFL = w.segs[i+1]
 		} else {
-			w.segMu.Lock()
 			nextFL = w.segFirst
-			w.segMu.Unlock()
 		}
 		maxInSeg := nextFL - 1
 		if maxInSeg <= upTo {
-			// Entire segment is superseded — delete it.
 			if err := os.Remove(w.segPath(fl)); err != nil && !os.IsNotExist(err) {
 				return err
 			}
@@ -318,37 +337,12 @@ func (w *WAL) TruncatePrefix(upTo uint64) error {
 func (w *WAL) committer() {
 	defer w.wg.Done()
 
-	for {
-		var batch []pendingWrite
-		var buf []byte
-
-		// Wait for the first pending write (or stop signal).
-		select {
-		case pw := <-w.pendingCh:
-			batch = append(batch, pw)
-			buf = append(buf, pw.data...)
-		case <-w.stopCh:
+	flush := func(batch []pendingWrite, buf []byte) {
+		if len(batch) == 0 {
 			return
 		}
-
-		// Drain any additional writes that arrived concurrently (non-blocking).
-	drain:
-		for {
-			select {
-			case pw := <-w.pendingCh:
-				batch = append(batch, pw)
-				buf = append(buf, pw.data...)
-			default:
-				break drain
-			}
-		}
-
 		maxLSN := batch[len(batch)-1].lsn
-
-		// Rotate the segment if needed before writing.
 		err := w.maybeRotate(maxLSN)
-
-		// Write + fsync.
 		if err == nil {
 			w.segMu.Lock()
 			_, err = w.segFile.Write(buf)
@@ -358,15 +352,42 @@ func (w *WAL) committer() {
 			w.segSize += int64(len(buf))
 			w.segMu.Unlock()
 		}
-
 		if err == nil {
 			w.durableLSN.Store(maxLSN)
 		}
-
-		// Notify all producers in this batch.
 		for _, pw := range batch {
 			pw.done <- err
 		}
+	}
+
+	drainPending := func(batch []pendingWrite, buf []byte) ([]pendingWrite, []byte) {
+		for {
+			select {
+			case pw := <-w.pendingCh:
+				batch = append(batch, pw)
+				buf = append(buf, pw.data...)
+			default:
+				return batch, buf
+			}
+		}
+	}
+
+	for {
+		var batch []pendingWrite
+		var buf []byte
+
+		select {
+		case pw := <-w.pendingCh:
+			batch = append(batch, pw)
+			buf = append(buf, pw.data...)
+		case <-w.stopCh:
+			batch, buf = drainPending(batch, buf)
+			flush(batch, buf)
+			return
+		}
+
+		batch, buf = drainPending(batch, buf)
+		flush(batch, buf)
 	}
 }
 

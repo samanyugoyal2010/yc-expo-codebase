@@ -71,6 +71,8 @@ type DeadMessage struct {
 	Priority     uint8
 	Attempts     uint16
 	EnqueuedAtMs int64
+	indexRef     uint64
+	payloadRef   uint64
 }
 
 // Stats is a point-in-time snapshot of queue utilisation.

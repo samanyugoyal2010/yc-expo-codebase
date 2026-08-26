@@ -417,3 +417,34 @@ func TestQueueSurvivesServerRestart(t *testing.T) {
 		t.Fatalf("after restart = %+v", lr.Messages)
 	}
 }
+
+func TestQueueSurvivesUncleanRestart(t *testing.T) {
+	dir := t.TempDir()
+	b, err := queue.OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(b, nil))
+	base := srv.URL + "/v1/queues"
+	do(t, http.MethodPost, base, map[string]any{"name": "crash", "order": "fifo"}, nil)
+	do(t, http.MethodPost, base+"/crash/messages", map[string]any{"messages": []map[string]any{
+		{"body": "one"}, {"body": "two"},
+	}}, nil)
+	srv.Close()
+	if err := b.CloseWithoutCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	b2, err := queue.OpenBroker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Close()
+	srv2 := httptest.NewServer(New(b2, nil))
+	defer srv2.Close()
+	var lr leaseResp
+	do(t, http.MethodPost, srv2.URL+"/v1/queues/crash/lease", map[string]any{"max": 5}, &lr)
+	if len(lr.Messages) != 2 || lr.Messages[0].Body != "one" || lr.Messages[1].Body != "two" {
+		t.Fatalf("after unclean restart = %+v", lr.Messages)
+	}
+}

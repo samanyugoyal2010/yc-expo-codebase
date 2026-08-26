@@ -14,6 +14,7 @@
 package queue
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -178,4 +179,18 @@ func (b *Broker) Close() error {
 	}
 	b.queues = make(map[string]*Queue)
 	return b.pages.Close()
+}
+
+// CloseWithoutCheckpoint closes files without writing index.dat, simulating a
+// crash after operations that already fsynced (enqueue/ack returned to the caller).
+func (b *Broker) CloseWithoutCheckpoint() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var errs []error
+	for _, q := range b.queues {
+		errs = append(errs, q.closeWithoutCheckpoint())
+	}
+	b.queues = make(map[string]*Queue)
+	errs = append(errs, b.pages.Close())
+	return errors.Join(errs...)
 }

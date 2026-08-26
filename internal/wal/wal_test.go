@@ -14,10 +14,12 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 func openWAL(t *testing.T) *WAL {
@@ -454,5 +456,62 @@ func TestDeadLetterAndNack(t *testing.T) {
 	d := recs[4].Body.(Dead)
 	if d.MsgID != 5 || d.Reason != 1 {
 		t.Fatalf("dead record = %+v", d)
+	}
+}
+
+func TestCloseDrainsPending(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 200
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok := 0
+	progress := make(chan struct{}, 1)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := w.Append(Record{Op: OpAck, Body: Ack{MsgID: uint64(i)}})
+			if err == nil {
+				mu.Lock()
+				ok++
+				mu.Unlock()
+				select {
+				case progress <- struct{}{}:
+				default:
+				}
+			} else if !errors.Is(err, ErrClosed) {
+				t.Errorf("append: %v", err)
+			}
+		}(i)
+	}
+	select {
+	case <-progress:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no append completed before Close")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+
+	w2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	var count int
+	if err := w2.Replay(0, func(_ uint64, _ Record) error { count++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if count != ok {
+		t.Fatalf("replayed %d, successful appends %d", count, ok)
+	}
+	if ok == 0 {
+		t.Fatal("expected some appends to succeed before/during Close")
 	}
 }

@@ -25,6 +25,7 @@ type heapEntry struct {
 	priority     uint8
 	indexRef     uint64
 	enqueuedAtMs int64
+	cachedPri    int // effective priority at last refresh/push; Less() uses only this
 }
 
 // readyHeap is a max-priority, direction-aware heap that implements the
@@ -32,11 +33,15 @@ type heapEntry struct {
 //
 //	primary key:   effective priority (descending)
 //	secondary key: msg_id × dir  (dir = +1 FIFO, −1 LIFO)
+//
+// cachedPri is a heap key, not a live clock read. Age boost is applied at
+// push and on refresh(), then heap.Init restores the invariant. Reading
+// time inside Less() would violate container/heap's contract.
 type readyHeap struct {
-	entries  []heapEntry
-	dir      int64       // +1 FIFO, -1 LIFO
-	agingMs  int64       // 0 = disabled
-	nowFn    func() int64
+	entries []heapEntry
+	dir     int64 // +1 FIFO, -1 LIFO
+	agingMs int64 // 0 = disabled
+	nowFn   func() int64
 }
 
 func newReadyHeap(order types.Order, agingMs int64, nowFn func() int64) *readyHeap {
@@ -47,11 +52,10 @@ func newReadyHeap(order types.Order, agingMs int64, nowFn func() int64) *readyHe
 	return &readyHeap{dir: dir, agingMs: agingMs, nowFn: nowFn}
 }
 
-// effPriority returns the effective priority of an entry, boosted by age.
-func (h *readyHeap) effPriority(e heapEntry) int {
+func (h *readyHeap) computePri(e heapEntry, now int64) int {
 	p := int(e.priority)
-	if h.agingMs > 0 && h.nowFn != nil {
-		age := h.nowFn() - e.enqueuedAtMs
+	if h.agingMs > 0 {
+		age := now - e.enqueuedAtMs
 		if age > 0 {
 			boost := int(age / h.agingMs)
 			p += boost
@@ -63,15 +67,33 @@ func (h *readyHeap) effPriority(e heapEntry) int {
 	return p
 }
 
+func (h *readyHeap) now() int64 {
+	if h.nowFn == nil {
+		return 0
+	}
+	return h.nowFn()
+}
+
+// refresh recomputes age-boosted priorities and re-heapifies. Call from the
+// ticker while holding the queue lock. No-op when aging is disabled.
+func (h *readyHeap) refresh() {
+	if h.agingMs <= 0 || len(h.entries) == 0 {
+		return
+	}
+	now := h.now()
+	for i := range h.entries {
+		h.entries[i].cachedPri = h.computePri(h.entries[i], now)
+	}
+	heap.Init(h)
+}
+
 func (h *readyHeap) Len() int { return len(h.entries) }
 
 func (h *readyHeap) Less(i, j int) bool {
 	a, b := h.entries[i], h.entries[j]
-	pa, pb := h.effPriority(a), h.effPriority(b)
-	if pa != pb {
-		return pa > pb // higher effective priority first
+	if a.cachedPri != b.cachedPri {
+		return a.cachedPri > b.cachedPri
 	}
-	// Within the same priority: FIFO or LIFO by msg_id.
 	return int64(a.msgID)*h.dir < int64(b.msgID)*h.dir
 }
 
@@ -90,6 +112,9 @@ func (h *readyHeap) Pop() any {
 	return x
 }
 
-func (h *readyHeap) push(e heapEntry) { heap.Push(h, e) }
+func (h *readyHeap) push(e heapEntry) {
+	e.cachedPri = h.computePri(e, h.now())
+	heap.Push(h, e)
+}
 
 func (h *readyHeap) pop() heapEntry { return heap.Pop(h).(heapEntry) }

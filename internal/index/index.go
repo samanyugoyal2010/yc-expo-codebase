@@ -25,9 +25,9 @@
 //	  checkpointLSN  u64
 //	  count          u32  (number of live entries)
 //	  reserved       u32
-//	[Entry × count: 64 bytes each]
+//	[Entry × count: 72 bytes each]
 //	  ref            u64   (SlotRef — page store address of this index slot)
-//	  slot data      56 bytes (same encoding as before)
+//	  slot data      64 bytes
 package index
 
 import (
@@ -51,8 +51,9 @@ const (
 )
 
 const (
-	entrySize  = 64 // ref(8) + slotData(52) + crc(4)
+	entrySize  = 72 // ref(8) + slotData(64)
 	headerSize = 16
+	slotCRCOff = 56 // CRC32 over slot bytes [0:56]
 )
 
 // Slot is the in-memory record for one message.
@@ -70,8 +71,9 @@ const (
 //	[44]    Priority       u8
 //	[45]    State          u8
 //	[46:48] Attempts       u16
-//	[48:52] CRC32          u32   (over bytes [0:48])
-//	[52:56] reserved       u32
+//	[48:56] LeaseNonce     u64   (0 = no durable lease)
+//	[56:60] CRC32          u32   (over bytes [0:56])
+//	[60:64] reserved       u32
 type Slot struct {
 	MsgID         uint64
 	EnqueuedAtMs  int64
@@ -82,6 +84,7 @@ type Slot struct {
 	Priority      uint8
 	State         uint8
 	Attempts      uint16
+	LeaseNonce    uint64
 }
 
 // Index is the in-memory message index backed by the page store.
@@ -262,8 +265,8 @@ func (idx *Index) load(data []byte) error {
 		raw := data[off : off+entrySize]
 		ref := binary.LittleEndian.Uint64(raw[0:8])
 		slotRaw := raw[8:entrySize]
-		computed := crc32.ChecksumIEEE(slotRaw[:48])
-		stored := binary.LittleEndian.Uint32(slotRaw[48:52])
+		computed := crc32.ChecksumIEEE(slotRaw[:slotCRCOff])
+		stored := binary.LittleEndian.Uint32(slotRaw[slotCRCOff : slotCRCOff+4])
 		if computed != stored {
 			return fmt.Errorf("index: entry %d CRC mismatch", i)
 		}
@@ -285,8 +288,9 @@ func encodeSlot(b []byte, s Slot) {
 	b[44] = s.Priority
 	b[45] = s.State
 	binary.LittleEndian.PutUint16(b[46:48], s.Attempts)
-	binary.LittleEndian.PutUint32(b[48:52], crc32.ChecksumIEEE(b[:48]))
-	// [52:56] reserved
+	binary.LittleEndian.PutUint64(b[48:56], s.LeaseNonce)
+	binary.LittleEndian.PutUint32(b[56:60], crc32.ChecksumIEEE(b[:56]))
+	// [60:64] reserved
 }
 
 func decodeSlot(b []byte) Slot {
@@ -300,5 +304,6 @@ func decodeSlot(b []byte) Slot {
 		Priority:      b[44],
 		State:         b[45],
 		Attempts:      binary.LittleEndian.Uint16(b[46:48]),
+		LeaseNonce:    binary.LittleEndian.Uint64(b[48:56]),
 	}
 }
