@@ -166,6 +166,16 @@ curl localhost:8080/v1/stats
 | GET | `/v1/queues/{q}/stats` | Queue depths and lifetime counters |
 | GET | `/v1/stats` | Page store pages, live bytes, total bytes |
 
+## FAQ
+
+**How do you handle replay messages?** Replay takes dead-lettered messages off the DLQ, re-enqueues them as brand-new messages (same payload and priority, optional delay, fresh IDs and attempt counts), and only frees the old slots if that enqueue succeeds — if it fails, they go right back on the dead list.
+
+**How would you refactor your queue into a Pub/Sub?** I'd keep the WAL, page store, and lease/ack machinery, then fan a published message out into per-subscriber queues (or per-subscriber cursors on a shared log) so each consumer still gets its own delivery, retry, and dead-letter story instead of competing for one pop.
+
+**If you had more time, what other features would you add?** Kill-9 crash tests, poison-pill inspection in the UI, per-queue metrics, idempotent producer keys, and a simple consumer group so you can scale readers without inventing a whole new broker.
+
+**Why would users choose this over Amazon SQS, RabbitMQ, or Apache Pulsar?** They wouldn't pick it for a company-wide bus — those already won on ops, fan-out, and scale — they'd pick it when they want one Go binary, a store they actually own, and FIFO/LIFO plus priority plus delay composed in one queue without standing up a cluster.
+
 ## Performance
 
 Measured on Apple M-series (single process, httptest.Server, macOS SSD). All enqueue results are **fully durable** (payload fsync + WAL fsync before returning to the caller). All delivery results verified **zero missed messages**.
